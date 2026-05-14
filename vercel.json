@@ -1,0 +1,5 @@
+{
+  "installCommand": "bun install --frozen-lockfile",
+  "buildCommand": "vite build --config vite.config.vercel.ts",
+  "framework": null
+}
