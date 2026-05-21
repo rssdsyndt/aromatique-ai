@@ -12,7 +12,7 @@ Secara umum sistem terdiri dari:
 
 | Layer | Teknologi | Peran |
 | --- | --- | --- |
-| Frontend | React 19, TanStack Start, Vite, Tailwind CSS | UI chatbot, consent, rekomendasi, feedback, history |
+| Frontend | React 19, TanStack Start, Vite, Tailwind CSS 3.4 | UI chatbot, consent, rekomendasi, feedback, history |
 | Hosting | Vercel | Hosting aplikasi web production |
 | Backend API | Supabase Edge Function `aromatique-chat` | Chat streaming, assignment A/B/C, NLU, ranking produk, explanation generation |
 | Database | Supabase Postgres | Menyimpan percakapan, message log, rekomendasi, feedback, product catalog, KG edges, eksperimen |
@@ -836,7 +836,7 @@ vite.config.vercel.ts
 
 ```json
 {
-  "installCommand": "bun install --frozen-lockfile",
+  "installCommand": "npm ci",
   "buildCommand": "vite build --config vite.config.vercel.ts",
   "framework": null
 }
