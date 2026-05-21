@@ -2,6 +2,34 @@
 import { createClient } from '@supabase/supabase-js';
 import type { Database } from './types';
 
+const fallbackStorage = new Map<string, string>();
+
+const safeBrowserStorage = {
+  getItem(key: string) {
+    try {
+      return window.localStorage.getItem(key) ?? fallbackStorage.get(key) ?? null;
+    } catch {
+      return fallbackStorage.get(key) ?? null;
+    }
+  },
+  setItem(key: string, value: string) {
+    fallbackStorage.set(key, value);
+    try {
+      window.localStorage.setItem(key, value);
+    } catch {
+      // Storage can be unavailable in Safari/privacy contexts.
+    }
+  },
+  removeItem(key: string) {
+    fallbackStorage.delete(key);
+    try {
+      window.localStorage.removeItem(key);
+    } catch {
+      // Storage can be unavailable in Safari/privacy contexts.
+    }
+  },
+};
+
 function createSupabaseClient() {
   // Use import.meta.env for client-side (Vite build-time replacement)
   // Fall back to process.env for SSR (server-side rendering)
@@ -20,7 +48,7 @@ function createSupabaseClient() {
 
   return createClient<Database>(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
     auth: {
-      storage: typeof window !== 'undefined' ? localStorage : undefined,
+      storage: typeof window !== 'undefined' ? safeBrowserStorage : undefined,
       persistSession: true,
       autoRefreshToken: true,
     }

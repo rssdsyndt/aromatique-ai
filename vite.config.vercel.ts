@@ -8,6 +8,11 @@ import { nitro } from "nitro/vite";
 import tsConfigPaths from "vite-tsconfig-paths";
 
 export default defineConfig({
+  build: {
+    // Vite 7 defaults to Safari 16.4. Keep the Vercel bundle usable on older iOS Safari.
+    target: "es2020",
+    cssTarget: "safari14",
+  },
   plugins: [
     tsConfigPaths(),
     tailwindcss(),

@@ -76,10 +76,47 @@ const FAMILIARITY_OPTIONS: { value: Familiarity; label: string; message: string 
   { value: "kolektor", label: "💎 Kolektor", message: "Saya kolektor parfum." },
 ];
 
+const sessionStorageFallback = new Map<string, string>();
+
+function getBrowserStorageItem(key: string) {
+  try {
+    return window.localStorage.getItem(key) ?? sessionStorageFallback.get(key) ?? null;
+  } catch {
+    return sessionStorageFallback.get(key) ?? null;
+  }
+}
+
+function setBrowserStorageItem(key: string, value: string) {
+  sessionStorageFallback.set(key, value);
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // Some Safari/privacy contexts disable localStorage. Keep this tab working in memory.
+  }
+}
+
+function createSessionId() {
+  const webCrypto = globalThis.crypto;
+  if (typeof webCrypto?.randomUUID === "function") return webCrypto.randomUUID();
+
+  if (typeof webCrypto?.getRandomValues === "function") {
+    const bytes = webCrypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+
+  return `aromatique-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
 function getSessionId() {
   if (typeof window === "undefined") return "";
-  let s = localStorage.getItem(SESSION_KEY);
-  if (!s) { s = crypto.randomUUID(); localStorage.setItem(SESSION_KEY, s); }
+  let s = getBrowserStorageItem(SESSION_KEY);
+  if (!s) {
+    s = createSessionId();
+    setBrowserStorageItem(SESSION_KEY, s);
+  }
   return s;
 }
 
@@ -295,7 +332,7 @@ export default function AromatiqueApp() {
 
   async function beginConversation() {
     if (startingConversation) return;
-    localStorage.setItem(CONSENT_KEY, "1");
+    setBrowserStorageItem(CONSENT_KEY, "1");
     setShowConsent(false);
     const activeSessionId = sessionId || getSessionId();
     setSessionId(activeSessionId);
@@ -592,7 +629,7 @@ export default function AromatiqueApp() {
   }
 
   return (
-    <div className={`ambient-bg w-full flex relative ${view === "chat" ? "h-[100dvh] overflow-hidden" : "min-h-screen"}`}>
+    <div className={`ambient-bg w-full flex relative ${view === "chat" ? "chat-viewport-shell overflow-hidden" : "min-h-screen"}`}>
       {/* Sidebar */}
       <aside className={`${sidebarOpen ? "translate-x-0 lg:w-72" : "-translate-x-full lg:w-0"} transition-[transform,width] duration-300 flex flex-col fixed lg:sticky left-0 top-0 h-screen w-72 lg:shrink-0 bg-white/90 lg:bg-white/80 backdrop-blur-2xl border-r border-white/40 z-50 overflow-hidden`} style={{ boxShadow: "0 24px 60px rgba(112,70,183,0.08)" }}>
         <div className="w-72 h-full flex flex-col p-6 gap-6">
@@ -865,7 +902,7 @@ function ChatScreen(props: {
   }, []);
 
   return (
-    <div className="flex-1 w-full relative overflow-hidden" style={{ height: "calc(100dvh - 72px)" }}>
+    <div className="chat-screen-height flex-1 w-full relative overflow-hidden">
       <div
         className="absolute inset-0 overflow-y-auto px-4 lg:px-12 pt-6 lg:pt-8 no-scrollbar flex flex-col items-center"
         style={{ paddingBottom: composerHeight + 24 }}
