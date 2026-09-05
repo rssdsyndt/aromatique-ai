@@ -49,6 +49,7 @@ export type Database = {
           explanation_type: string | null
           id: string
           model_version: string | null
+          response_times: Json | null
           session_id: string
         }
         Insert: {
@@ -58,6 +59,7 @@ export type Database = {
           explanation_type?: string | null
           id?: string
           model_version?: string | null
+          response_times?: Json | null
           session_id: string
         }
         Update: {
@@ -67,6 +69,7 @@ export type Database = {
           explanation_type?: string | null
           id?: string
           model_version?: string | null
+          response_times?: Json | null
           session_id?: string
         }
         Relationships: [

@@ -59,6 +59,32 @@ type RecBatch = {
 };
 type View = "welcome" | "chat" | "recs" | "feedback" | "thanks";
 
+/**
+ * Satu klik jawaban pada kuesioner.
+ *
+ * `at_ms` adalah jam dinding sejak halaman feedback dibuka, `active_ms` adalah
+ * jam yang sama dikurangi seluruh jeda (tab disembunyikan / pindah layar).
+ * Keduanya disimpan mentah supaya metrik apa pun bisa diturunkan belakangan
+ * tanpa mengulang pengumpulan data.
+ *
+ * `since_prev_ms` sengaja `null` untuk klik pertama. Klik pertama tidak
+ * mengukur deliberasi melainkan orientasi awal — membaca header, memindai
+ * kedelapan pertanyaan, memutuskan mulai dari mana — jadi nilainya tidak
+ * sebanding dengan klik berikutnya. `null` membuat keputusan metodologis itu
+ * ikut tersimpan di datanya: AVG() di SQL melewatkannya dengan sendirinya,
+ * sehingga waktu orientasi tidak bisa tidak sengaja tercampur ke rata-rata
+ * deliberasi. Angka mentahnya tetap ada di `at_ms` dan di `onset_ms`.
+ */
+type FeedbackEvent = {
+  order: number;
+  code: string;
+  value: number;
+  at_ms: number;
+  active_ms: number;
+  since_prev_ms: number | null;
+  is_change: boolean;
+};
+
 const SESSION_KEY = "aromatique_session_id";
 const CONSENT_KEY = "aromatique_consent_v1";
 const MODEL_VERSION = "kgat_baseline_epoch69_v1";
@@ -284,8 +310,50 @@ export default function AromatiqueApp() {
   const [recs, setRecs] = useState<RecBatch[]>([]);
   const [history, setHistory] = useState<{ id: string; title: string; created_at: string }[]>([]);
   const [feedback, setFeedback] = useState<Record<string, number>>({});
+  const [submittingFeedback, setSubmittingFeedback] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+
+  // Paradata kuesioner. Semua di ref, bukan state: nilainya tidak pernah
+  // dirender, jadi mencatatnya tidak perlu memicu re-render. Ditaruh di parent
+  // supaya jamnya selamat saat FeedbackScreen unmount (partisipan bisa pindah
+  // ke layar chat lewat sidebar lalu kembali lagi).
+  const fbOpenedAtRef = useRef<number | null>(null);
+  const fbEventsRef = useRef<FeedbackEvent[]>([]);
+  const fbPausedMsRef = useRef(0);
+  const fbPausedSinceRef = useRef<number | null>(null);
+  const fbPauseReasonRef = useRef<"hidden" | "away" | null>(null);
+  const fbHiddenMsRef = useRef(0);
+  const fbAwayMsRef = useRef(0);
+
+  function fbResetTiming() {
+    fbOpenedAtRef.current = null;
+    fbEventsRef.current = [];
+    fbPausedMsRef.current = 0;
+    fbPausedSinceRef.current = null;
+    fbPauseReasonRef.current = null;
+    fbHiddenMsRef.current = 0;
+    fbAwayMsRef.current = 0;
+  }
+
+  // Jeda dimulai saat partisipan tidak sedang menatap kuesioner: tab
+  // disembunyikan, atau pindah ke layar lain. Tanpa ini, detour tiga menit ke
+  // layar chat akan terbaca sebagai "berpikir lama" di pertanyaan berikutnya.
+  function fbPauseStart(reason: "hidden" | "away") {
+    if (fbOpenedAtRef.current === null || fbPausedSinceRef.current !== null) return;
+    fbPausedSinceRef.current = Date.now();
+    fbPauseReasonRef.current = reason;
+  }
+
+  function fbPauseEnd() {
+    if (fbPausedSinceRef.current === null) return;
+    const delta = Date.now() - fbPausedSinceRef.current;
+    fbPausedMsRef.current += delta;
+    if (fbPauseReasonRef.current === "hidden") fbHiddenMsRef.current += delta;
+    else fbAwayMsRef.current += delta;
+    fbPausedSinceRef.current = null;
+    fbPauseReasonRef.current = null;
+  }
 
   useEffect(() => {
     const s = getSessionId();
@@ -295,6 +363,25 @@ export default function AromatiqueApp() {
   }, []);
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
   useEffect(() => { if (typeof window !== "undefined") window.scrollTo({ top: 0, behavior: "auto" }); }, [view]);
+
+  // Jam kuesioner: dimulai sekali saat layar feedback pertama dibuka, lalu
+  // dijeda tiap partisipan meninggalkannya dan dilanjutkan saat kembali.
+  useEffect(() => {
+    if (view !== "feedback") {
+      fbPauseStart("away");
+      return;
+    }
+    if (fbOpenedAtRef.current === null) fbOpenedAtRef.current = Date.now();
+    else fbPauseEnd();
+
+    if (typeof document === "undefined") return;
+    const onVisibility = () => {
+      if (document.hidden) fbPauseStart("hidden");
+      else fbPauseEnd();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [view]);
 
   async function loadHistory(s: string) {
     const { data } = await supabase.from("conversations").select("id,title,created_at").eq("session_id", s).order("created_at", { ascending: false });
@@ -342,6 +429,12 @@ export default function AromatiqueApp() {
     setConvId(null);
     setMessages([]);
     setRecs([]);
+    // Jawaban kuesioner sebelumnya ikut dibuang. Tanpa ini, percakapan baru
+    // mewarisi kedelapan jawaban lama dalam keadaan sudah lengkap, sehingga
+    // partisipan bisa mengirim ulang jawaban basi untuk percakapan yang berbeda.
+    setFeedback({});
+    setSubmittingFeedback(false);
+    fbResetTiming();
     setView("chat");
     setActiveNav("chat");
 
@@ -591,17 +684,103 @@ export default function AromatiqueApp() {
 
   const totalFb = FEEDBACK_GROUPS.reduce((a, g) => a + g.items.length, 0);
 
+  function recordFeedbackAnswer(code: string, value: number) {
+    const now = Date.now();
+    if (fbOpenedAtRef.current === null) fbOpenedAtRef.current = now;
+
+    // Jeda yang sedang berjalan ikut dihitung, supaya klik yang terjadi tepat
+    // setelah tab kembali aktif tidak membawa durasi jeda ke dalam active_ms.
+    const pausedNow = fbPausedMsRef.current
+      + (fbPausedSinceRef.current !== null ? now - fbPausedSinceRef.current : 0);
+    const atMs = now - fbOpenedAtRef.current;
+    const activeMs = Math.max(0, atMs - pausedNow);
+
+    const events = fbEventsRef.current;
+    const prev = events[events.length - 1];
+
+    // Klik ulang pada nilai yang sama tetap dicatat sebagai interaksi, tapi
+    // bukan perubahan jawaban — kalau tidak, `changes` menggelembung oleh klik
+    // ganda dan tidak lagi bisa dibaca sebagai indikator keraguan.
+    let lastValue: number | undefined;
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].code === code) { lastValue = events[i].value; break; }
+    }
+
+    events.push({
+      order: events.length + 1,
+      code,
+      value,
+      at_ms: atMs,
+      active_ms: activeMs,
+      since_prev_ms: prev ? Math.max(0, activeMs - prev.active_ms) : null,
+      is_change: lastValue !== undefined && lastValue !== value,
+    });
+
+    setFeedback(f => ({ ...f, [code]: value }));
+  }
+
+  function fbBuildResponseTimes() {
+    fbPauseEnd();
+    const openedAt = fbOpenedAtRef.current;
+    if (openedAt === null) return null;
+
+    const events = fbEventsRef.current;
+    const submittedAt = Date.now();
+
+    // Ringkasan turunan, murni demi kenyamanan query. Kebenarannya tetap ada di
+    // `events` — semua angka di sini bisa dihitung ulang dari sana.
+    const perQuestion: Record<string, {
+      order: number; first_ms: number; active_ms: number;
+      since_prev_ms: number | null; last_ms: number; changes: number;
+    }> = {};
+    for (const e of events) {
+      const seen = perQuestion[e.code];
+      if (seen) {
+        seen.last_ms = e.at_ms;
+        if (e.is_change) seen.changes += 1;
+      } else {
+        perQuestion[e.code] = {
+          order: e.order, first_ms: e.at_ms, active_ms: e.active_ms,
+          since_prev_ms: e.since_prev_ms, last_ms: e.at_ms, changes: 0,
+        };
+      }
+    }
+
+    return {
+      schema: 1,
+      opened_at: new Date(openedAt).toISOString(),
+      submitted_at: new Date(submittedAt).toISOString(),
+      total_ms: submittedAt - openedAt,
+      hidden_ms: fbHiddenMsRef.current,
+      away_ms: fbAwayMsRef.current,
+      onset_ms: events.length > 0 ? events[0].active_ms : null,
+      events,
+      per_question: perQuestion,
+    };
+  }
+
   async function submitFeedback() {
     if (Object.keys(feedback).length < totalFb) { toast.error("Mohon jawab semua pertanyaan"); return; }
     if (!convId) return;
+    if (submittingFeedback) return;
+    setSubmittingFeedback(true);
     const latest = recs[recs.length - 1];
-    await supabase.from("feedback").insert({
+    const { error } = await supabase.from("feedback").insert({
       conversation_id: convId,
       session_id: sessionId,
       answers: feedback,
       explanation_type: latest?.explanation_type ?? condition,
       model_version: latest?.model_version ?? MODEL_VERSION,
+      response_times: fbBuildResponseTimes(),
     });
+    setSubmittingFeedback(false);
+    if (error) {
+      // Sebelumnya hasil insert diabaikan dan layar terima kasih tetap tampil,
+      // jadi kegagalan menyimpan tidak terlihat oleh siapa pun. Tahan di layar
+      // ini supaya partisipan bisa mencoba lagi dan jawabannya tidak hilang.
+      toast.error("Jawaban gagal tersimpan. Mohon coba kirim sekali lagi.");
+      return;
+    }
     setView("thanks");
   }
 
@@ -716,8 +895,8 @@ export default function AromatiqueApp() {
           </Suspense>
         )}
         {view === "feedback" && (
-          <FeedbackScreen feedback={feedback} setFeedback={setFeedback} onSubmit={submitFeedback}
-            fbAnswered={fbAnswered} fbReady={fbReady} totalFb={totalFb} />
+          <FeedbackScreen feedback={feedback} onAnswer={recordFeedbackAnswer} onSubmit={submitFeedback}
+            fbAnswered={fbAnswered} fbReady={fbReady} totalFb={totalFb} submitting={submittingFeedback} />
         )}
         {view === "thanks" && <ThanksScreen onNew={beginConversation} />}
       </main>
@@ -998,10 +1177,10 @@ function ChatScreen(props: {
 }
 
 /* ========== FEEDBACK ========== */
-function FeedbackScreen({ feedback, setFeedback, onSubmit, fbAnswered, fbReady, totalFb }: {
+function FeedbackScreen({ feedback, onAnswer, onSubmit, fbAnswered, fbReady, totalFb, submitting }: {
   feedback: Record<string, number>;
-  setFeedback: (f: (prev: Record<string, number>) => Record<string, number>) => void;
-  onSubmit: () => void; fbAnswered: number; fbReady: boolean; totalFb: number;
+  onAnswer: (code: string, value: number) => void;
+  onSubmit: () => void; fbAnswered: number; fbReady: boolean; totalFb: number; submitting: boolean;
 }) {
   const [showConfirm, setShowConfirm] = useState(false);
   return (
@@ -1029,7 +1208,7 @@ function FeedbackScreen({ feedback, setFeedback, onSubmit, fbAnswered, fbReady, 
                   {SCALE.map(s => {
                     const sel = v === s.v;
                     return (
-                      <button key={s.v} type="button" onClick={() => setFeedback(f => ({ ...f, [q.code]: s.v }))}
+                      <button key={s.v} type="button" onClick={() => onAnswer(q.code, s.v)}
                         className="group flex flex-col items-center gap-2 flex-1">
                         <div className={`w-12 h-12 rounded-full flex items-center justify-center transition-all duration-300 ${sel ? "bg-[#ac82f7] text-white shadow-lg" : "bg-[#f5f3f6] text-[#5b5553] group-hover:bg-[#eaddff] group-hover:text-[#7046b7]"}`}
                           style={sel ? { boxShadow: "0 8px 20px rgba(172,130,247,0.35)" } : {}}>
@@ -1055,10 +1234,10 @@ function FeedbackScreen({ feedback, setFeedback, onSubmit, fbAnswered, fbReady, 
               <div className="h-full transition-all duration-500" style={{ width: `${(fbAnswered / totalFb) * 100}%`, background: "linear-gradient(90deg, #ac82f7, #7046b7)" }} />
             </div>
           </div>
-          <button onClick={() => setShowConfirm(true)} disabled={!fbReady}
+          <button onClick={() => setShowConfirm(true)} disabled={!fbReady || submitting}
             className="px-6 py-3 lg:px-8 lg:py-4 rounded-full font-bold text-[13px] lg:text-[14px] uppercase tracking-[0.1em] transition-all disabled:opacity-50 flex-shrink-0"
             style={{ background: fbReady ? "#ac82f7" : "#ccc3d4", color: "#fff", boxShadow: fbReady ? "0 8px 20px rgba(172,130,247,0.35)" : "none" }}>
-            Kirim
+            {submitting ? "Menyimpan…" : "Kirim"}
           </button>
         </div>
       </div>
