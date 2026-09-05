@@ -1,0 +1,98 @@
+name: Supabase Keepalive
+
+# Supabase free tier mem-pause project setelah 7 hari tanpa aktivitas.
+# Workflow ini mengirim satu query ringan setiap hari supaya project tetap aktif,
+# sehingga web Aromatique AI tidak berhenti di halaman informed consent.
+
+on:
+  schedule:
+    # 02:17 UTC = 09:17 WIB setiap hari.
+    # Menit ganjil dipakai sengaja: cron GitHub sering tertunda di menit :00.
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: supabase-keepalive
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Ping Supabase REST API
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SUPABASE_URL}" ] || [ -z "${SUPABASE_KEY}" ]; then
+            echo "::error::Secret SUPABASE_URL atau SUPABASE_PUBLISHABLE_KEY belum diset."
+            exit 1
+          fi
+
+          endpoint="${SUPABASE_URL}/rest/v1/products?select=product_id&limit=1"
+
+          # Project yang sedang bangun dari cold start bisa lambat merespons,
+          # jadi dicoba beberapa kali sebelum dianggap gagal.
+          for attempt in 1 2 3 4 5; do
+            code=$(curl --silent --show-error --location \
+              --max-time 60 \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              --header "apikey: ${SUPABASE_KEY}" \
+              --header "Authorization: Bearer ${SUPABASE_KEY}" \
+              "${endpoint}" || echo "000")
+
+            echo "Percobaan ${attempt}: HTTP ${code}"
+
+            if [ "${code}" = "200" ]; then
+              echo "Supabase merespons normal. Project tetap aktif."
+              exit 0
+            fi
+
+            if [ "${attempt}" -lt 5 ]; then
+              sleep $((attempt * 20))
+            fi
+          done
+
+          echo "::error::Supabase tidak merespons 200 setelah 5 percobaan (terakhir: ${code})."
+          exit 1
+
+  # GitHub menonaktifkan scheduled workflow di repo publik yang tidak ada
+  # aktivitas selama 60 hari. Commit kecil sebulan sekali menahan itu,
+  # supaya jadwal di atas tidak mati sendiri.
+  keep-schedule-alive:
+    needs: ping
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refresh keepalive stamp once a month
+        run: |
+          set -euo pipefail
+
+          stamp_file=".github/keepalive-stamp.txt"
+          last_run=""
+          [ -f "${stamp_file}" ] && last_run=$(head -n 1 "${stamp_file}" | cut -c1-7)
+          this_month=$(date -u +%Y-%m)
+
+          if [ "${last_run}" = "${this_month}" ]; then
+            echo "Stamp bulan ${this_month} sudah ada. Tidak perlu commit."
+            exit 0
+          fi
+
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > "${stamp_file}"
+          echo "Penanda aktivitas repo agar scheduled workflow tidak dinonaktifkan GitHub." >> "${stamp_file}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${stamp_file}"
+          git commit -m "chore: refresh keepalive stamp"
+          git push
