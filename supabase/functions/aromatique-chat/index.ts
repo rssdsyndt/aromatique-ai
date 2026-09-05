@@ -99,9 +99,19 @@ type RecommendationOutput = {
   match: number;
 };
 
+/**
+ * Penjelasan dari LLM dipetakan lewat dua Map terpisah, bukan satu.
+ *
+ * `product_id` di database ini bertipe TEXT berisi angka ("2", "8", "56"),
+ * sementara rank juga "1", "2", "3". Kalau keduanya ditaruh di satu Map, kunci
+ * mereka berebut ruang nama: produk ber-product_id "2" di peringkat 1 akan
+ * tertimpa oleh penulisan rank "2" milik produk peringkat 2, sehingga produk
+ * pertama menampilkan penjelasan produk kedua.
+ */
 type GptExplanationResult = {
   summary: string | null;
-  reasons: Map<string, string>;
+  reasonsByProductId: Map<string, string>;
+  reasonsByRank: Map<string, string>;
   payload: Record<string, unknown>;
 };
 
@@ -325,10 +335,12 @@ async function recommend(req: Request, messages: Msg[], payload: Record<string, 
   });
 
   const gptExplanation = await explainRecommendationsWithGPT(assignment, profile, recommendations);
-  if (gptExplanation.reasons.size > 0) {
+  if (gptExplanation.reasonsByProductId.size > 0 || gptExplanation.reasonsByRank.size > 0) {
     recommendations = recommendations.map((recommendation) => ({
       ...recommendation,
-      reason: gptExplanation.reasons.get(recommendation.product_id) ?? gptExplanation.reasons.get(String(recommendation.rank)) ?? recommendation.reason,
+      reason: gptExplanation.reasonsByProductId.get(recommendation.product_id)
+        ?? gptExplanation.reasonsByRank.get(String(recommendation.rank))
+        ?? recommendation.reason,
     }));
   }
 
@@ -835,7 +847,8 @@ async function explainRecommendationsWithGPT(
   if (!key) {
     return {
       summary: null,
-      reasons: new Map(),
+      reasonsByProductId: new Map(),
+      reasonsByRank: new Map(),
       payload: { status: "fallback_no_openai_key", input },
     };
   }
@@ -871,13 +884,14 @@ Runtime API constraints:
     if (!resp.ok) {
       const text = await resp.text();
       console.error("OpenAI explanation error", resp.status, text);
-      return { summary: null, reasons: new Map(), payload: { status: "fallback_openai_error", input, error: text } };
+      return { summary: null, reasonsByProductId: new Map(), reasonsByRank: new Map(), payload: { status: "fallback_openai_error", input, error: text } };
     }
 
     const data = await resp.json();
     const content = data?.choices?.[0]?.message?.content;
     const parsed = parseJsonObject(content);
-    const reasons = new Map<string, string>();
+    const reasonsByProductId = new Map<string, string>();
+    const reasonsByRank = new Map<string, string>();
 
     if (parsed && typeof parsed === "object") {
       const output = parsed as Record<string, unknown>;
@@ -898,23 +912,29 @@ Runtime API constraints:
         if (!reason) continue;
         const productId = stringValue(record.product_id) ?? productIdsByName.get(normalize(stringValue(record.product_name) ?? ""));
         const rank = typeof record.rank === "number" ? String(record.rank) : stringValue(record.rank);
-        if (productId) reasons.set(productId, reason);
-        if (rank) reasons.set(rank, reason);
+        if (productId) reasonsByProductId.set(productId, reason);
+        if (rank) reasonsByRank.set(rank, reason);
       }
 
       return {
         summary: typeof output.summary === "string" && output.summary.trim() ? output.summary.trim() : null,
-        reasons,
-        payload: { status: reasons.size > 0 ? "gpt" : "fallback_invalid_gpt_output", input, output },
+        reasonsByProductId,
+        reasonsByRank,
+        payload: {
+          status: reasonsByProductId.size > 0 || reasonsByRank.size > 0 ? "gpt" : "fallback_invalid_gpt_output",
+          input,
+          output,
+        },
       };
     }
 
-    return { summary: null, reasons, payload: { status: "fallback_parse_error", input, raw: content } };
+    return { summary: null, reasonsByProductId, reasonsByRank, payload: { status: "fallback_parse_error", input, raw: content } };
   } catch (error) {
     console.error("Explanation generation failed", error);
     return {
       summary: null,
-      reasons: new Map(),
+      reasonsByProductId: new Map(),
+      reasonsByRank: new Map(),
       payload: { status: "fallback_exception", input, error: error instanceof Error ? error.message : String(error) },
     };
   }
