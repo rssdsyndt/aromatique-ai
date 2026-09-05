@@ -759,7 +759,7 @@ export default function AromatiqueApp() {
     };
   }
 
-  async function submitFeedback() {
+  async function submitFeedback(smelledFragrance: boolean) {
     if (Object.keys(feedback).length < totalFb) { toast.error("Mohon jawab semua pertanyaan"); return; }
     if (!convId) return;
     if (submittingFeedback) return;
@@ -768,7 +768,11 @@ export default function AromatiqueApp() {
     const { error } = await supabase.from("feedback").insert({
       conversation_id: convId,
       session_id: sessionId,
-      answers: feedback,
+      // Jawaban dialog konfirmasi ikut dititipkan ke `answers` supaya tabel
+      // feedback tidak perlu kolom tambahan. Sengaja tidak disimpan di state
+      // `feedback`: pengecekan kelengkapan menghitung jumlah key di sana dan
+      // mengharapkan tepat delapan item Likert.
+      answers: { ...feedback, smelled_fragrance: smelledFragrance },
       explanation_type: latest?.explanation_type ?? condition,
       model_version: latest?.model_version ?? MODEL_VERSION,
       response_times: fbBuildResponseTimes(),
@@ -1180,7 +1184,8 @@ function ChatScreen(props: {
 function FeedbackScreen({ feedback, onAnswer, onSubmit, fbAnswered, fbReady, totalFb, submitting }: {
   feedback: Record<string, number>;
   onAnswer: (code: string, value: number) => void;
-  onSubmit: () => void; fbAnswered: number; fbReady: boolean; totalFb: number; submitting: boolean;
+  onSubmit: (smelledFragrance: boolean) => void;
+  fbAnswered: number; fbReady: boolean; totalFb: number; submitting: boolean;
 }) {
   const [showConfirm, setShowConfirm] = useState(false);
   return (
@@ -1254,13 +1259,13 @@ function FeedbackScreen({ feedback, onAnswer, onSubmit, fbAnswered, fbReady, tot
             </div>
             <div className="grid grid-cols-2 gap-3">
               <button
-                onClick={() => { setShowConfirm(false); onSubmit(); }}
+                onClick={() => { setShowConfirm(false); onSubmit(false); }}
                 className="py-3 rounded-full bg-[#f3f1f4] border border-[#ccc3d4]/60 text-[#19191b] font-bold text-[14px] active:scale-[0.98] transition-transform"
               >
                 Tidak
               </button>
               <button
-                onClick={() => { setShowConfirm(false); onSubmit(); }}
+                onClick={() => { setShowConfirm(false); onSubmit(true); }}
                 className="py-3 rounded-full text-white font-bold text-[14px] active:scale-[0.98] transition-transform"
                 style={{ background: "linear-gradient(135deg, #ac82f7, #7046b7)", boxShadow: "0 8px 20px rgba(172,130,247,0.35)" }}
               >
