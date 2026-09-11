@@ -1,1 +1,8 @@
 project_id = "esqzngqpfwrlcnapmfpx"
+
+# Fungsi ini memvalidasi pemanggilnya sendiri lewat isAuthorizedRequest, dan
+# frontend memanggilnya dengan publishable key yang bukan JWT. Tanpa baris ini
+# setiap deploy akan mengembalikan verify_jwt ke default true dan menolak
+# seluruh permintaan dari aplikasi.
+[functions.aromatique-chat]
+verify_jwt = false
