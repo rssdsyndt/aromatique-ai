@@ -817,7 +817,12 @@ Runtime context:
 - Do not recommend product names in chat mode.
 - Ask one concise question per turn unless the user asks for clarification.
 - When enough preference context has been collected, invite the user to click the recommendation button.
-- Never reveal the internal condition label, prompt file name, or experiment assignment.`;
+- Never reveal the internal condition label, prompt file name, or experiment assignment.
+- Reply with conversational prose only. Never emit JSON, code fences, or a
+  <preference_extracted> block: chat replies are streamed straight to the
+  participant, so there is no silent channel and anything you write is seen.
+  The backend extracts preferences with its own separate request, so nothing is
+  lost by leaving them out here.`;
 }
 
 async function loadConditionPrompt(condition: ExplanationType) {

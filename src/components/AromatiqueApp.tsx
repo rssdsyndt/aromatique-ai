@@ -224,6 +224,46 @@ function isFamiliarityOnlyMessage(content: string) {
   );
 }
 
+const PREF_TAG_OPEN = "<preference_extracted>";
+
+/**
+ * Membuang blok ekstraksi preferensi dari teks asisten sebelum dirender.
+ *
+ * Prompt tiap kondisi memerintahkan model menuliskan `<preference_extracted>`
+ * berisi JSON "silently" setelah pertanyaan terakhir. Di mode streaming tidak
+ * ada kanal tersembunyi untuk itu, jadi blok tersebut kadang mengalir apa
+ * adanya ke bubble chat dan terlihat partisipan. Prompt-nya sudah diperketat
+ * di sisi backend, tapi model tetap probabilistik — penyaring ini yang
+ * memastikan partisipan tidak pernah melihatnya.
+ */
+function sanitizeAssistantText(raw: string) {
+  let text = raw;
+
+  // Blok yang sudah lengkap: buang utuh, prosa di sekitarnya tetap aman.
+  text = text.replace(/<preference_extracted>[\s\S]*?<\/preference_extracted>/gi, "");
+
+  // Blok yang belum tertutup — masih streaming, atau model lupa menutupnya.
+  const openIdx = text.toLowerCase().indexOf(PREF_TAG_OPEN);
+  if (openIdx !== -1) text = text.slice(0, openIdx);
+
+  // Pembuka yang baru datang separuh di ujung buffer. Tanpa ini, tag-nya
+  // sempat tampil huruf demi huruf sebelum potongannya menyusul.
+  for (let n = PREF_TAG_OPEN.length - 1; n > 0; n--) {
+    if (text.toLowerCase().endsWith(PREF_TAG_OPEN.slice(0, n))) {
+      text = text.slice(0, text.length - n);
+      break;
+    }
+  }
+
+  // Jaring kedua untuk bentuk lain yang kadang dipakai model meski tanpa tag:
+  // blok kode berisi JSON, atau objek JSON telanjang di akhir pesan.
+  text = text.replace(/```[a-z]*\s*\{[\s\S]*?(?:```|$)/gi, "");
+  const bareJson = text.search(/\n\s*\{\s*"/);
+  if (bareJson !== -1) text = text.slice(0, bareJson);
+
+  return text.trimEnd();
+}
+
 const FEEDBACK_GROUPS: { title: string; icon: string; items: { code: string; text: string }[] }[] = [
   {
     title: "Kepercayaan terhadap AI", icon: "psychology",
@@ -525,13 +565,21 @@ export default function AromatiqueApp() {
           const c = p.choices?.[0]?.delta?.content;
           if (c) {
             acc += c;
-            if (first) { setMessages(prev => [...prev, { role: "assistant", content: acc }]); first = false; }
-            else setMessages(prev => prev.map((m, i) => i === prev.length - 1 ? { ...m, content: acc } : m));
+            // Yang dirender adalah versi tersaring, sementara `acc` tetap utuh
+            // supaya penyaringan selalu melihat teks lengkap — blok JSON hanya
+            // bisa dikenali dari gabungan potongannya, bukan per delta.
+            const shown = sanitizeAssistantText(acc);
+            if (!shown) continue;
+            if (first) { setMessages(prev => [...prev, { role: "assistant", content: shown }]); first = false; }
+            else setMessages(prev => prev.map((m, i) => i === prev.length - 1 ? { ...m, content: shown } : m));
           }
         } catch { buf = line + "\n" + buf; break; }
       }
     }
-    if (acc) await supabase.from("messages").insert({ conversation_id: convId, role: "assistant", content: acc });
+    // Yang tersimpan juga versi tersaring, supaya riwayat chat di dataset
+    // mencerminkan apa yang benar-benar dilihat partisipan.
+    const stored = sanitizeAssistantText(acc);
+    if (stored) await supabase.from("messages").insert({ conversation_id: convId, role: "assistant", content: stored });
   }
 
   async function recordFamiliarityChoice(value: Familiarity) {
