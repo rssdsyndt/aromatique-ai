@@ -6,8 +6,8 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-const MODEL_VERSION = "kgat_baseline_epoch69_v1";
-const RECOMMENDATION_ENGINE = "kgat_baseline";
+const MODEL_VERSION = "p1_order2_tfidf_v3";
+const RECOMMENDATION_ENGINE = "accord_cooccurrence_order2";
 const OPENAI_CHAT_MODEL = "gpt-4o-mini";
 const PROMPT_VERSION = "v1";
 const CONDITIONS = ["A", "B", "C"] as const;
@@ -32,17 +32,6 @@ type ProductRow = {
   visual_notes: string[] | null;
 };
 
-type KgEdge = {
-  head_entity_id: number;
-  head_entity_type: string;
-  head_name: string;
-  relation_name: string;
-  tail_entity_id: number;
-  tail_entity_type: string;
-  tail_name: string;
-  head_product_id: string | null;
-};
-
 type PreferenceProfile = {
   terms: Set<string>;
   negativeTerms: Set<string>;
@@ -51,11 +40,14 @@ type PreferenceProfile = {
   nlu: NluProfile | null;
 };
 
+type SharedPair = { accords: [string, string]; contribution: number };
+
 type ScoredProduct = {
   product: ProductRow;
   score: number;
   matchScore: number;
   matchedTerms: Set<string>;
+  sharedPairs: SharedPair[];
 };
 
 type PromptMetadata = {
@@ -148,6 +140,7 @@ const PREFERENCE_LEXICON: { label: string; aliases: string[]; terms: string[] }[
 ];
 
 const RELATION_LABEL: Record<string, string> = {
+  shares_accord_pair: "berbagi pasangan accord",
   has_accord: "memiliki accord",
   has_visual_note: "memiliki visual note",
   belongs_to_family: "berada di family",
@@ -303,16 +296,8 @@ async function recommend(req: Request, messages: Msg[], payload: Record<string, 
   const ranked = selectRecommendationBatch(rankProducts(products as ProductRow[], profile), excludedProductIds, 3);
   const topProductIds = ranked.map((item) => item.product.product_id);
 
-  const { data: kgEdges, error: edgeError } = await supabase
-    .from("kg_edges")
-    .select("head_entity_id,head_entity_type,head_name,relation_name,tail_entity_id,tail_entity_type,tail_name,head_product_id")
-    .eq("model_version", MODEL_VERSION)
-    .in("head_product_id", topProductIds);
-
-  if (edgeError) throw edgeError;
-
   let recommendations: RecommendationOutput[] = ranked.map((item, index) => {
-    const kgPath = buildKgPath(item, (kgEdges ?? []) as KgEdge[]);
+    const kgPath = buildKgPath(item);
     const reason = buildReason(item, kgPath, assignment.condition);
     return {
       rank: index + 1,
@@ -498,61 +483,100 @@ async function extractPreferencesWithGPT(messages: Msg[], products: ProductRow[]
   };
 }
 
+/**
+ * Pemeringkatan P1 (ko-okurensi accord orde dua) dari tesis Azam Azri Ahmad, v3.
+ *
+ * Setiap parfum direpresentasikan sebagai token accord tunggal ditambah token
+ * pasangan accord (pasangan tak berurutan). Token diberi bobot IDF yang dihaluskan,
+ * idf(t) = ln((1 + M) / (1 + df(t))) + 1, dengan df dihitung dari M produk katalog.
+ * Vektor biner * idf dinormalisasi L2 bersama (unigram + bigram satu norma), lalu
+ * skor = kosinus kueri-produk. Tidak ada parameter terlatih.
+ *
+ * Kueri adalah himpunan accord preferensi pengguna (profile.terms yang ada di
+ * kosakata accord katalog). Accord yang dihindari sudah dikeluarkan dari terms
+ * oleh extractPreferencesHybrid.
+ */
 function rankProducts(products: ProductRow[], profile: PreferenceProfile): ScoredProduct[] {
-  const scored = products.map((product) => {
-    const exactTerms = new Set(productTerms(product));
-    const searchable = normalize([
-      product.product_name,
-      product.visual_note,
-      product.revolutionize,
-      product.main_accords,
-      product.olfactory_family,
-      product.meaning,
-      ...(product.accords ?? []),
-      ...(product.visual_notes ?? []),
-    ].filter(Boolean).join(" "));
+  const productAccords = products.map((product) => accordSet(product));
+  const accordVocab = new Set(productAccords.flatMap((set) => Array.from(set)));
+  const queryAccords = new Set(Array.from(profile.terms).filter((term) => accordVocab.has(term)));
 
-    let score = product.data_quality === "COMPLETE" ? 2 : 0;
+  if (queryAccords.size === 0) return rankWithoutPreference(products, productAccords);
+
+  const df = new Map<string, number>();
+  const productTokens = productAccords.map((accords) => {
+    const tokens = order2Tokens(accords);
+    tokens.forEach((token) => df.set(token, (df.get(token) ?? 0) + 1));
+    return tokens;
+  });
+  const m = products.length;
+  const idf = (token: string) => Math.log((1 + m) / (1 + (df.get(token) ?? 0))) + 1;
+
+  const queryTokens = order2Tokens(queryAccords);
+  const queryNorm = Math.sqrt(queryTokens.reduce((sum, token) => sum + idf(token) ** 2, 0));
+
+  const scored = products.map((product, index) => {
+    const tokens = productTokens[index];
+    const productNorm = Math.sqrt(tokens.reduce((sum, token) => sum + idf(token) ** 2, 0));
+    const denominator = queryNorm * productNorm || 1;
+    const tokenSet = new Set(tokens);
+
+    let score = 0;
     const matchedTerms = new Set<string>();
-
-    for (const term of profile.terms) {
-      if (exactTerms.has(term)) {
-        score += 12;
-        matchedTerms.add(term);
-      } else if (searchable.includes(term)) {
-        score += 5;
-        matchedTerms.add(term);
+    const sharedPairs: SharedPair[] = [];
+    for (const token of queryTokens) {
+      if (!tokenSet.has(token)) continue;
+      const contribution = idf(token) ** 2 / denominator;
+      score += contribution;
+      const pair = token.split(PAIR_SEPARATOR);
+      if (pair.length === 2) {
+        sharedPairs.push({ accords: [pair[0], pair[1]], contribution });
+      } else {
+        matchedTerms.add(token);
       }
     }
-
-    for (const term of profile.negativeTerms) {
-      if (exactTerms.has(term)) {
-        score -= 10;
-      } else if (searchable.includes(term)) {
-        score -= 5;
-      }
-    }
-
-    if (profile.terms.size === 0) {
-      score += (product.accords?.length ?? 0) * 0.5;
-      if (product.revolutionize) score += 1;
-    }
+    sharedPairs.sort((a, b) => b.contribution - a.contribution);
 
     return {
       product,
       score,
-      matchScore: Math.max(62, Math.min(98, Math.round(62 + score * 2.4))),
+      matchScore: Math.max(62, Math.min(98, Math.round(62 + score * 36))),
       matchedTerms,
+      sharedPairs,
     };
   });
 
   return scored.sort((a, b) => {
     if (b.score !== a.score) return b.score - a.score;
-    const aComplete = a.product.data_quality === "COMPLETE" ? 1 : 0;
-    const bComplete = b.product.data_quality === "COMPLETE" ? 1 : 0;
-    if (bComplete !== aComplete) return bComplete - aComplete;
     return a.product.kgat_product_id - b.product.kgat_product_id;
   });
+}
+
+const PAIR_SEPARATOR = "\u0000";
+
+function accordSet(product: ProductRow) {
+  const raw = product.accords?.length ? product.accords : splitTerms(product.main_accords ?? "");
+  return new Set(raw.map(normalize).filter(Boolean));
+}
+
+function order2Tokens(accords: Set<string>) {
+  const sorted = Array.from(accords).sort();
+  const tokens = [...sorted];
+  for (let i = 0; i < sorted.length; i++) {
+    for (let j = i + 1; j < sorted.length; j++) tokens.push(sorted[i] + PAIR_SEPARATOR + sorted[j]);
+  }
+  return tokens;
+}
+
+// Tanpa accord preferensi, P1 memberi skor nol untuk semua produk. Urutan cadangan
+// ini mempertahankan perilaku lama: produk berdata lengkap dengan accord terbanyak.
+function rankWithoutPreference(products: ProductRow[], productAccords: Set<string>[]): ScoredProduct[] {
+  return products
+    .map((product, index) => {
+      const score = (product.data_quality === "COMPLETE" ? 2 : 0) + productAccords[index].size * 0.5 + (product.revolutionize ? 1 : 0);
+      return { product, score, matchScore: 62, matchedTerms: new Set<string>(), sharedPairs: [] };
+    })
+    .sort((a, b) => b.score - a.score || a.product.kgat_product_id - b.product.kgat_product_id);
 }
 
 function selectRecommendationBatch(ranked: ScoredProduct[], excludedProductIds: Set<string>, size: number) {
@@ -567,27 +591,23 @@ function selectRecommendationBatch(ranked: ScoredProduct[], excludedProductIds: 
   return [...fresh, ...fallback];
 }
 
-function buildKgPath(item: ScoredProduct, edges: KgEdge[]) {
-  const productEdges = edges.filter((edge) => edge.head_product_id === item.product.product_id);
-  const preferredRelations = ["has_accord", "has_visual_note", "belongs_to_family", "inspired_by"];
-
-  const pathEdges = productEdges
-    .filter((edge) => preferredRelations.includes(edge.relation_name))
-    .map((edge) => {
-      const normalizedTail = normalize(edge.tail_name);
-      const matched = item.matchedTerms.has(normalizedTail) || Array.from(item.matchedTerms).some((term) => normalizedTail.includes(term));
+// Jalur penjelasan P1: pasangan accord yang dimiliki bersama oleh kueri dan produk,
+// diurutkan menurut sumbangan skornya. Bentuk objeknya sama dengan kg_path lama
+// supaya frontend dan prompt penjelasan tidak perlu diubah.
+function buildKgPath(item: ScoredProduct) {
+  if (item.sharedPairs.length > 0) {
+    return item.sharedPairs.slice(0, 5).map(({ accords }) => {
+      const entity = accords.join(" + ");
       return {
-        relation: edge.relation_name,
-        entity: edge.tail_name,
-        matched,
-        reason: relationReason(edge.relation_name, edge.tail_name, matched),
+        relation: "shares_accord_pair",
+        entity,
+        matched: true,
+        reason: relationReason("shares_accord_pair", entity, true),
       };
-    })
-    .sort((a, b) => Number(b.matched) - Number(a.matched));
+    });
+  }
 
-  if (pathEdges.length > 0) return pathEdges.slice(0, 5);
-
-  return (item.product.accords ?? []).slice(0, 3).map((accord) => ({
+  return Array.from(item.product.accords ?? []).slice(0, 3).map((accord) => ({
     relation: "has_accord",
     entity: accord,
     matched: item.matchedTerms.has(normalize(accord)),
@@ -609,10 +629,11 @@ function buildReason(item: ScoredProduct, kgPath: ReturnType<typeof buildKgPath>
   }
 
   const pathText = kgPath.slice(0, 3).map((path) => `${RELATION_LABEL[path.relation] ?? path.relation} ${path.entity}`).join("; ");
-  return `Jalur knowledge graph untuk ${product.product_name} menunjukkan: ${pathText}. Karena beberapa node ini beririsan dengan preferensimu, produk ini masuk Top-3.`;
+  return `Jalur pasangan accord untuk ${product.product_name} menunjukkan: ${pathText}. Karena kombinasi accord ini beririsan dengan preferensimu, produk ini masuk Top-3.`;
 }
 
 function relationReason(relation: string, entity: string, matched: boolean) {
+  if (relation === "shares_accord_pair") return `Kombinasi accord ${entity} sama-sama ada pada preferensi pengguna dan produk.`;
   if (matched) return `Node ${entity} cocok langsung dengan preferensi pengguna.`;
   if (relation === "has_accord") return `Accord ${entity} membentuk karakter aroma produk.`;
   if (relation === "has_visual_note") return `Visual note ${entity} membantu menjelaskan kesan aroma produk.`;
